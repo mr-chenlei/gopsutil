@@ -15,19 +15,49 @@ var invoke common.Invoker = common.Invoke{}
 // A HostInfoStat describes the host status.
 // This is not in the psutil but it useful.
 type InfoStat struct {
-	Hostname             string `json:"hostname"`
-	Uptime               uint64 `json:"uptime"`
-	BootTime             uint64 `json:"bootTime"`
-	Procs                uint64 `json:"procs"`           // number of processes
-	OS                   string `json:"os"`              // ex: freebsd, linux
-	Platform             string `json:"platform"`        // ex: ubuntu, linuxmint
-	PlatformFamily       string `json:"platformFamily"`  // ex: debian, rhel
-	PlatformVersion      string `json:"platformVersion"` // version of the complete OS
-	KernelVersion        string `json:"kernelVersion"`   // version of the OS kernel (if available)
-	KernelArch           string `json:"kernelArch"`      // native cpu architecture queried at runtime, as returned by `uname -m` or empty string in case of error
-	VirtualizationSystem string `json:"virtualizationSystem"`
-	VirtualizationRole   string `json:"virtualizationRole"` // guest or host
-	HostID               string `json:"hostId"`             // ex: uuid
+	Hostname               string `json:"hostname"`
+	Uptime                 uint64 `json:"uptime"`
+	BootTime               uint64 `json:"bootTime"`
+	Procs                  uint64 `json:"procs"`           // number of processes
+	OS                     string `json:"os"`              // ex: freebsd, linux
+	Platform               string `json:"platform"`        // ex: ubuntu, linuxmint
+	PlatformFamily         string `json:"platformFamily"`  // ex: debian, rhel
+	PlatformVersion        string `json:"platformVersion"` // version of the complete OS
+	KernelVersion          string `json:"kernelVersion"`   // version of the OS kernel (if available)
+	KernelArch             string `json:"kernelArch"`      // native cpu architecture queried at runtime, as returned by `uname -m` or empty string in case of error
+	VirtualizationSystem   string `json:"virtualizationSystem"`
+	VirtualizationRole     string `json:"virtualizationRole"` // guest or host
+	HostID                 string `json:"hostId"`             // ex: uuid
+	RegisteredOwner        string
+	RegisteredOrganization string
+	OSBuildType            string
+	ProductID              string
+	OSInstallDateTime      string
+	SystemManufacture      string
+	SystemModel            string
+	SystemType             string
+	BIOSVersion            string
+	WindowsDirectory       string
+	SystemDirectory        string
+	BootDevice             string
+	InstalledAppList       []*AppInfo
+	SystemLocale           string
+	InputLocale            string
+	TimeZone               string
+	PageFileLocation       string
+	Domain                 string
+	LogonServer            string
+	HotFixList             []string
+	UUID                   string
+}
+
+type AppInfo struct {
+	Name            string
+	Version         string
+	InstallDate     string
+	InstallSource   string
+	InstallLocation string
+	Publisher       string
 }
 
 type UserStat struct {
@@ -110,6 +140,91 @@ func InfoWithContext(ctx context.Context) (*InfoStat, error) {
 	}
 
 	ret.HostID, err = HostIDWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.RegisteredOwner, ret.RegisteredOrganization, err = RegisterInfoWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.OSBuildType, err = OSBuildTypeWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.ProductID, err = ProductIDWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.OSInstallDateTime, err = OSInstallDateTimeWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.SystemManufacture, ret.SystemModel, ret.SystemType, err = SystemManufactureWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.BIOSVersion, err = BIOSVersionWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.WindowsDirectory, ret.SystemDirectory, err = SystemDirectoryWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.BootDevice, err = BootDeviceWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.InstalledAppList, err = InstalledAppListWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.SystemLocale, err = SystemLocaleWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.InputLocale, err = InputLocaleWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.TimeZone, err = TimeZoneWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.PageFileLocation, err = PageFileLocationWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.Domain, err = DomainWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.LogonServer, err = LogonServerWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.HotFixList, err = HotFixListWithContext(ctx)
+	if err != nil && err != common.ErrNotImplementedError {
+		return nil, err
+	}
+
+	ret.UUID, err = OSUUIDWithContext(ctx)
 	if err != nil && err != common.ErrNotImplementedError {
 		return nil, err
 	}

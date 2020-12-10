@@ -5,11 +5,16 @@ package host
 import (
 	"context"
 	"fmt"
+	"github.com/denisbrodbeck/machineid"
+	"github.com/digitalocean/go-smbios/smbios"
+	"golang.org/x/sys/windows/registry"
 	"math"
+	"os"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/StackExchange/wmi"
@@ -24,6 +29,14 @@ var (
 	procGetTickCount64          = common.Modkernel32.NewProc("GetTickCount64")
 	procGetNativeSystemInfo     = common.Modkernel32.NewProc("GetNativeSystemInfo")
 	procRtlGetVersion           = common.ModNt.NewProc("RtlGetVersion")
+	procGetTimeZoneInformation  = common.Modkernel32.NewProc("GetTimeZoneInformation")
+	procGetSystemTime           = common.Modkernel32.NewProc("GetSystemTime")
+	procNetGetJoinInformation   = common.ModNet.NewProc("NetGetJoinInformation")
+	procNetApiBufferFree        = common.ModNet.NewProc("NetApiBufferFree")
+	procGetLocaleInfo           = common.Modkernel32.NewProc("GetLocaleInfoW")
+	procSHLoadIndirectString    = common.ModShl.NewProc("SHLoadIndirectString")
+	procGetKeyboardLayout       = common.ModUser.NewProc("GetKeyboardLayout")
+	procGetSystemDirectoryA     = common.Modkernel32.NewProc("GetSystemDirectoryA")
 )
 
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/content/wdm/ns-wdm-_osversioninfoexw
@@ -53,6 +66,27 @@ type systemInfo struct {
 	dwAllocationGranularity     uint32
 	wProcessorLevel             uint16
 	wProcessorRevision          uint16
+}
+
+type systemTime struct {
+	wYear         uint16
+	wMonth        uint16
+	wDayOfWeek    uint16
+	wDay          uint16
+	wHour         uint16
+	wMinute       uint16
+	wSecond       uint16
+	wMilliseconds uint16
+}
+
+type timeZoneInfo struct {
+	Bias         int32
+	StandardName [32]uint16
+	StandardDate systemTime
+	StandardBias int32
+	DaylightName [32]uint16
+	DaylightDate systemTime
+	DaylightBias int32
 }
 
 type msAcpi_ThermalZoneTemperature struct {
@@ -98,6 +132,376 @@ func numProcs(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	return uint64(len(procs)), nil
+}
+
+func readFromRegistry(key windows.Handle, path, name string) (string, error) {
+	var err error
+	var result string
+	var h windows.Handle // like HostIDWithContext(), we query the registry using the raw windows.RegOpenKeyEx/RegQueryValueEx
+	err = windows.RegOpenKeyEx(key, windows.StringToUTF16Ptr(path), 0, windows.KEY_READ|windows.KEY_WOW64_64KEY, &h)
+	if err != nil {
+		return result, err
+	}
+	defer windows.RegCloseKey(h)
+	var bufLen uint32
+	var valType uint32
+	err = windows.RegQueryValueEx(h, windows.StringToUTF16Ptr(name), nil, &valType, nil, &bufLen)
+	if err != nil {
+		return result, err
+	}
+
+	switch valType {
+	case registry.SZ, registry.EXPAND_SZ:
+		regBuf := make([]uint16, bufLen/2+1)
+		err = windows.RegQueryValueEx(h, windows.StringToUTF16Ptr(name), nil, &valType, (*byte)(unsafe.Pointer(&regBuf[0])), &bufLen)
+		if err != nil {
+			return result, err
+		}
+		result = windows.UTF16ToString(regBuf[:])
+	case registry.MULTI_SZ:
+		regBuf := make([]uint16, bufLen/2+1)
+		err = windows.RegQueryValueEx(h, windows.StringToUTF16Ptr(name), nil, &valType, (*byte)(unsafe.Pointer(&regBuf[0])), &bufLen)
+		if err != nil {
+			return result, err
+		}
+		result = string(utf16.Decode(regBuf[:]))
+	case registry.BINARY:
+		regBuf := make([]uint16, bufLen)
+		err = windows.RegQueryValueEx(h, windows.StringToUTF16Ptr(name), nil, &valType, (*byte)(unsafe.Pointer(&regBuf[0])), &bufLen)
+		if err != nil {
+			return result, err
+		}
+		fmt.Printf("%x", regBuf[:])
+		result = string(utf16.Decode(regBuf[:]))
+	case registry.DWORD:
+		regBuf := make([]byte, 8)
+		err = windows.RegQueryValueEx(h, windows.StringToUTF16Ptr(name), nil, &valType, (*byte)(unsafe.Pointer(&regBuf[0])), &bufLen)
+		if err != nil {
+			return result, err
+		}
+		var val32 uint32
+		copy((*[4]byte)(unsafe.Pointer(&val32))[:], regBuf)
+		result = time.Unix(int64(val32), 0).String()
+	case registry.QWORD:
+		regBuf := make([]byte, 8)
+		err = windows.RegQueryValueEx(h, windows.StringToUTF16Ptr(name), nil, &valType, (*byte)(unsafe.Pointer(&regBuf[0])), &bufLen)
+		if err != nil {
+			return result, err
+		}
+		var val32 uint64
+		copy((*[4]byte)(unsafe.Pointer(&val32))[:], regBuf)
+		result = time.Unix(int64(val32), 0).String()
+	}
+	return result, err
+}
+
+func RegisterInfoWithContext(ctx context.Context) (string, string, error) {
+	var err error
+	var owner, organization string
+	// RegisteredOwner
+	owner, err = readFromRegistry(windows.HKEY_LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, `RegisteredOwner`)
+	if err != nil {
+		return owner, organization, err
+	}
+	// RegisteredOrganization
+	organization, err = readFromRegistry(windows.HKEY_LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, `RegisteredOrganization`)
+	if err != nil {
+		return owner, organization, err
+	}
+	return owner, organization, err
+}
+
+func OSBuildTypeWithContext(ctx context.Context) (string, error) {
+	var err error
+	var osType string
+	// CurrentType
+	osType, err = readFromRegistry(windows.HKEY_LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, `CurrentType`)
+	if err != nil {
+		return osType, err
+	}
+	return osType, err
+}
+
+func ProductIDWithContext(ctx context.Context) (string, error) {
+	var err error
+	var productID string
+	// ProductID
+	productID, err = readFromRegistry(windows.HKEY_LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, `ProductID`)
+	if err != nil {
+		return productID, err
+	}
+	return productID, err
+}
+
+func OSInstallDateTimeWithContext(ctx context.Context) (string, error) {
+	var err error
+	var installDate string
+	// InstallDate
+	installDate, err = readFromRegistry(windows.HKEY_LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, `InstallDate`)
+	if err != nil {
+		return "", err
+	}
+	return installDate, err
+}
+
+func SystemManufactureWithContext(ctx context.Context) (string, string, string, error) {
+	var err error
+	var manufacture, model, _type string
+
+	// Find SMBIOS data in operating system-specific location.
+	rc, _, err := smbios.Stream()
+	if err != nil {
+		return manufacture, model, _type, err
+	}
+	// Be sure to close the stream!
+	defer rc.Close()
+
+	// Decode SMBIOS structures from the stream.
+	d := smbios.NewDecoder(rc)
+	ss, err := d.Decode()
+	if err != nil {
+		return manufacture, model, _type, err
+	}
+
+	// Determine SMBIOS version and table location from entry point.
+	//major, minor, rev := ep.Version()
+	//addr, size := ep.Table()
+	//
+	//fmt.Printf("SMBIOS %d.%d.%d - table: address: %#x, size: %d\n",
+	//	major, minor, rev, addr, size)
+
+	for _, v := range ss {
+		if v.Header.Type == 1 && len(v.Strings) > 3 {
+			manufacture = v.Strings[0]
+			model = v.Strings[1]
+			_type = v.Strings[2]
+		}
+	}
+
+	return manufacture, model, _type, err
+}
+
+func BIOSVersionWithContext(ctx context.Context) (string, error) {
+	var err error
+	var version string
+	// Find SMBIOS data in operating system-specific location.
+	rc, _, err := smbios.Stream()
+	if err != nil {
+		return version, err
+	}
+	// Be sure to close the stream!
+	defer rc.Close()
+
+	// Decode SMBIOS structures from the stream.
+	d := smbios.NewDecoder(rc)
+	ss, err := d.Decode()
+	if err != nil {
+		return version, err
+	}
+
+	// Determine SMBIOS version and table location from entry point.
+	//major, minor, rev := ep.Version()
+	//addr, size := ep.Table()
+	//
+	//fmt.Printf("SMBIOS %d.%d.%d - table: address: %#x, size: %d\n",
+	//	major, minor, rev, addr, size)
+
+	for _, v := range ss {
+		if v.Header.Type == 0 && len(v.Strings) == 3 {
+			version = fmt.Sprintf("%v %v %v", v.Strings[0], v.Strings[1], v.Strings[2])
+		}
+	}
+
+	return version, err
+}
+
+func SystemDirectoryWithContext(ctx context.Context) (string, string, error) {
+	var err error
+	var windowsDir, systemDir string
+	windowsDir, err = windows.GetWindowsDirectory()
+	if err != nil {
+		return windowsDir, systemDir, err
+	}
+	systemDir, err = windows.GetSystemDirectory()
+	if err != nil {
+		return windowsDir, systemDir, err
+	}
+	return windowsDir, systemDir, err
+}
+
+func BootDeviceWithContext(ctx context.Context) (string, error) {
+	var err error
+	var bootDevice string
+	bootDevice, err = readFromRegistry(windows.HKEY_LOCAL_MACHINE, `SYSTEM\Setup`, `SystemPartition`)
+	if err != nil {
+		return bootDevice, err
+	}
+	return bootDevice, err
+}
+
+func InstalledAppListWithContext(ctx context.Context) ([]*AppInfo, error) {
+	var err error
+	var appList []*AppInfo
+	path := `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`
+
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.QUERY_VALUE|registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		return nil, err
+	}
+	defer k.Close()
+
+	params, err := k.ReadSubKeyNames(0)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, param := range params {
+		displayName, err := readFromRegistry(windows.HKEY_LOCAL_MACHINE, path+"\\"+param, "DisplayName")
+		if err != nil {
+			continue
+		}
+		displayVersion, _ := readFromRegistry(windows.HKEY_LOCAL_MACHINE, path+"\\"+param, "DisplayVersion")
+		installDate, _ := readFromRegistry(windows.HKEY_LOCAL_MACHINE, path+"\\"+param, "InstallDate")
+		installSource, _ := readFromRegistry(windows.HKEY_LOCAL_MACHINE, path+"\\"+param, "InstallSource")
+		installLocation, _ := readFromRegistry(windows.HKEY_LOCAL_MACHINE, path+"\\"+param, "InstallLocation")
+		publisher, _ := readFromRegistry(windows.HKEY_LOCAL_MACHINE, path+"\\"+param, "Publisher")
+		appList = append(appList, &AppInfo{
+			Name:            displayName,
+			Version:         displayVersion,
+			InstallDate:     installDate,
+			InstallSource:   installSource,
+			InstallLocation: installLocation,
+			Publisher:       publisher,
+		})
+	}
+
+	return appList, err
+}
+
+func SystemLocaleWithContext(ctx context.Context) (string, error) {
+	var err error
+	var systemLocale string
+	var buffer [1024]uint16
+
+	_, _, _ = procGetLocaleInfo.Call(uintptr(2048), uintptr(0x00000001), uintptr(unsafe.Pointer(&buffer[0])), uintptr(1024))
+	langID := windows.UTF16ToString(buffer[:])
+	systemLocale, _ = translateRFC1766(langID)
+
+	return systemLocale, err
+}
+
+func InputLocaleWithContext(ctx context.Context) (string, error) {
+	var err error
+	var inputLocale string
+	var HKL uintptr
+
+	HKL, _, _ = procGetKeyboardLayout.Call(uintptr(0))
+	langID := fmt.Sprintf("%04X", HKL&0x0000FFFF)
+	inputLocale, _ = translateRFC1766(langID)
+
+	return inputLocale, err
+}
+
+func translateRFC1766(langID string) (string, error) {
+	path := `MIME\\Database\\Rfc1766`
+	code, err := readFromRegistry(windows.HKEY_CLASSES_ROOT, path, langID)
+	if err != nil {
+		return "", err
+	}
+	pos := strings.Index(code, ";")
+	if pos == -1 {
+		return "", fmt.Errorf("parse %s result error", path)
+	}
+	tmp := windows.StringToUTF16(code[pos:])
+	procSHLoadIndirectString.Call(
+		uintptr(unsafe.Pointer(&tmp[1])),
+		uintptr(unsafe.Pointer(&tmp[1])),
+		uintptr(1024-pos-1),
+		uintptr(0))
+
+	return code[:pos] + windows.UTF16ToString(tmp[:]), nil
+}
+
+func TimeZoneWithContext(ctx context.Context) (string, error) {
+	var err error
+	var timezone string
+	path := `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones`
+
+	var timeZoneInfo timeZoneInfo
+	procGetTimeZoneInformation.Call(uintptr(unsafe.Pointer(&timeZoneInfo)))
+	standardName := windows.UTF16ToString(timeZoneInfo.StandardName[:])
+
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.QUERY_VALUE|registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		return timezone, err
+	}
+	defer k.Close()
+
+	params, err := k.ReadSubKeyNames(0)
+	if err != nil {
+		return timezone, err
+	}
+
+	for _, v := range params {
+		if v != standardName {
+			continue
+		}
+		timezone, err = readFromRegistry(windows.HKEY_LOCAL_MACHINE, path+"\\"+v, "Display")
+		break
+	}
+	return timezone, err
+}
+
+func PageFileLocationWithContext(ctx context.Context) (string, error) {
+	var err error
+	var location string
+	location, err = readFromRegistry(windows.HKEY_LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management`, `ExistingPageFiles`)
+	if err != nil {
+		return location, err
+	}
+	return location, err
+}
+
+func DomainWithContext(ctx context.Context) (string, error) {
+	var err error
+	var domain string
+	var netJoinStatus uint32
+	var p *[1 << 10]uint16
+
+	errno, _, _ := procNetGetJoinInformation.Call(0, uintptr(unsafe.Pointer(&p)), uintptr(unsafe.Pointer(&netJoinStatus)))
+	if errno != 0 {
+		return domain, syscall.Errno(errno)
+	}
+	defer procNetApiBufferFree.Call(uintptr(unsafe.Pointer(p)))
+	domain = syscall.UTF16ToString(p[:])
+
+	return domain, err
+}
+
+func LogonServerWithContext(ctx context.Context) (string, error) {
+	var err error
+	var logon string
+	logon, _ = os.LookupEnv("LOGONSERVER")
+	return logon, err
+}
+
+func HotFixListWithContext(ctx context.Context) ([]string, error) {
+	var err error
+	var appList []*AppInfo
+	var hotFix []string
+	appList, err = InstalledAppListWithContext(ctx)
+	for _, v := range appList {
+		if !strings.Contains(v.Name, "KB") {
+			continue
+		}
+		hotFix = append(hotFix, v.Name)
+
+	}
+	return hotFix, err
+}
+
+func OSUUIDWithContext(ctx context.Context) (string, error) {
+	return machineid.ID()
 }
 
 func UptimeWithContext(ctx context.Context) (uint64, error) {
